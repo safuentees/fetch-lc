@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
 fetch_lc.py — Fetch a LeetCode problem via the public GraphQL endpoint and
-emit a practice file in the right topic subdirectory.
+emit a LeetCode-style practice file in the right topic subdirectory.
+
+The practice file holds only the problem statement and LeetCode's own Python
+starter code. Example cases go to cases/<name>.json; run them with run_lc.py.
 
 Usage:
     python scripts/fetch_lc.py <slug-or-url> [--force] [--dir <subdir>]
+    python scripts/run_lc.py <practice-file>
 
 Examples:
     python scripts/fetch_lc.py interleaving-string
@@ -19,12 +23,10 @@ from __future__ import annotations
 import argparse
 import html
 import json
-import os
 import re
 import sys
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -40,10 +42,9 @@ query getQuestion($titleSlug: String!) {
     content
     difficulty
     exampleTestcases
-    sampleTestCase
     metaData
     topicTags { name slug }
-    hints
+    codeSnippets { langSlug code }
   }
 }
 """
@@ -75,28 +76,6 @@ TAG_TO_DIR = [
     ("String", "strings"),
     ("Array", "arrays"),
 ]
-
-# LeetCode metaData type → Python type hint
-TYPE_MAP = {
-    "integer": "int",
-    "integer[]": "List[int]",
-    "integer[][]": "List[List[int]]",
-    "long": "int",
-    "double": "float",
-    "boolean": "bool",
-    "string": "str",
-    "string[]": "List[str]",
-    "string[][]": "List[List[str]]",
-    "character": "str",
-    "character[]": "List[str]",
-    "character[][]": "List[List[str]]",
-    "ListNode": "Optional[ListNode]",
-    "TreeNode": "Optional[TreeNode]",
-    "void": "None",
-}
-
-NEEDS_LIST_IMPORT = ("List[",)
-NEEDS_OPTIONAL_IMPORT = ("Optional[",)
 
 
 # --------------------------------------------------------------------- HTTP --
@@ -138,9 +117,10 @@ def fetch_question(slug: str) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- HTML utils --
 
-_PRE_RE = re.compile(r"<pre>(.*?)</pre>", re.DOTALL | re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
 _BLANK_RE = re.compile(r"\n{3,}")
+# Design problems print "Output" with no colon and the value on the next line.
+_OUTPUT_RE = re.compile(r"^Output:?[ \t]*\n?(.+)$", re.MULTILINE)
 
 
 def strip_html(text: str) -> str:
@@ -158,7 +138,7 @@ def strip_html(text: str) -> str:
     text = _TAG_RE.sub("", text)
     text = html.unescape(text)
     # Tidy whitespace: strip <ul>/<li> indent, collapse runs.
-    text = text.replace("\u00a0", " ")
+    text = text.replace(" ", " ")
     cleaned = []
     for line in text.splitlines():
         line = line.lstrip("\t ")
@@ -169,78 +149,35 @@ def strip_html(text: str) -> str:
     return text
 
 
-def extract_examples(content_html: str) -> list[dict[str, str]]:
+# ------------------------------------------------------------- test cases ---
+
+def build_cases(q: dict[str, Any], description: str) -> list[dict[str, Any]]:
     """
-    Pull (input, output, explanation?) from each <pre> block in the content.
-    Returns list of dicts with keys input/output/explanation (strings).
+    Inputs come from `exampleTestcases` (one JSON value per line, one line per
+    param). Outputs are scraped from the "Output:" lines of the description.
+    A case without "output" is still run; its result is printed, not checked.
     """
-    examples: list[dict[str, str]] = []
-    for block in _PRE_RE.findall(content_html):
-        clean = strip_html(block)
-        ex: dict[str, str] = {}
-        for label in ("Input", "Output", "Explanation"):
-            m = re.search(
-                rf"{label}:\s*(.*?)(?=\n\s*(?:Input|Output|Explanation):|\Z)",
-                clean, re.DOTALL,
-            )
-            if m:
-                ex[label.lower()] = m.group(1).strip()
-        if "input" in ex and "output" in ex:
-            examples.append(ex)
-    return examples
-
-
-
-_BOOL_RE = re.compile(r"\b(true|false|null)\b")
-_LITERAL_FIX = {"true": "True", "false": "False", "null": "None"}
-
-
-def to_py_literal(raw: str) -> str:
-    """Translate JSON-ish literals (true/false/null) to Python equivalents."""
-    return _BOOL_RE.sub(lambda m: _LITERAL_FIX[m.group(1)], raw)
-
-# --------------------------------------------------------- input arg parser --
-
-# Matches "name = value" where value can be a list, quoted string, number, etc.
-# Splits on top-level commas only (depth-tracking — bracket-/quote-aware).
-
-def split_args(arg_str: str) -> list[tuple[str, str]]:
-    """Parse 'nums = [2,7,11,15], target = 9' → [('nums','[2,7,11,15]'), ('target','9')]."""
-    pairs: list[tuple[str, str]] = []
-    depth = 0
-    in_str: str | None = None
-    buf: list[str] = []
-    for ch in arg_str:
-        if in_str:
-            buf.append(ch)
-            if ch == in_str and (len(buf) < 2 or buf[-2] != "\\"):
-                in_str = None
-            continue
-        if ch in ("'", '"'):
-            in_str = ch
-            buf.append(ch)
-            continue
-        if ch in "[({":
-            depth += 1
-            buf.append(ch)
-            continue
-        if ch in "])}":
-            depth -= 1
-            buf.append(ch)
-            continue
-        if ch == "," and depth == 0:
-            chunk = "".join(buf).strip()
-            if "=" in chunk:
-                k, _, v = chunk.partition("=")
-                pairs.append((k.strip(), v.strip()))
-            buf = []
-            continue
-        buf.append(ch)
-    tail = "".join(buf).strip()
-    if "=" in tail:
-        k, _, v = tail.partition("=")
-        pairs.append((k.strip(), v.strip()))
-    return pairs
+    n_params = len(json.loads(q["metaData"]).get("params", [])) or 1
+    lines = [ln for ln in (q.get("exampleTestcases") or "").splitlines() if ln.strip()]
+    inputs = [
+        [json.loads(v) for v in lines[i:i + n_params]]
+        for i in range(0, len(lines) - n_params + 1, n_params)
+    ]
+    outputs = _OUTPUT_RE.findall(description)
+    if len(outputs) != len(inputs):
+        print(f"warning: {len(inputs)} inputs but {len(outputs)} outputs; "
+              f"expected values left out", file=sys.stderr)
+        outputs = []
+    cases: list[dict[str, Any]] = []
+    for i, args in enumerate(inputs):
+        case: dict[str, Any] = {"input": args}
+        if outputs:
+            try:
+                case["output"] = json.loads(outputs[i].strip())
+            except json.JSONDecodeError:
+                pass
+        cases.append(case)
+    return cases
 
 
 # ---------------------------------------------------------- topic detection --
@@ -256,142 +193,37 @@ def pick_subdir(topic_tags: list[dict[str, str]], override: str | None) -> str:
     return "."
 
 
-# ------------------------------------------------------- filename / typing ---
-
 def snake_title(title: str) -> str:
-    out = re.sub(r"[^a-zA-Z0-9]+", "_", title.lower()).strip("_")
-    return out
-
-
-def py_type(lc_type: str) -> str:
-    return TYPE_MAP.get(lc_type, "Any")
-
-
-@dataclass
-class Param:
-    name: str
-    py: str
-
-
-@dataclass
-class Signature:
-    method: str
-    params: list[Param]
-    ret: str
-
-
-def parse_meta(meta_json: str) -> Signature:
-    m = json.loads(meta_json)
-    params = [Param(p["name"], py_type(p["type"])) for p in m.get("params", [])]
-    ret_obj = m.get("return", {})
-    ret_type = ret_obj.get("type", "void") if isinstance(ret_obj, dict) else "void"
-    return Signature(
-        method=m.get("name", "solve"),
-        params=params,
-        ret=py_type(ret_type),
-    )
-
-
-def needed_imports(sig: Signature) -> list[str]:
-    blob = sig.ret + "|" + "|".join(p.py for p in sig.params)
-    imports: list[str] = []
-    if any(s in blob for s in NEEDS_LIST_IMPORT):
-        imports.append("from typing import List")
-    if any(s in blob for s in NEEDS_OPTIONAL_IMPORT):
-        imports.append("from typing import Optional")
-    if "Any" in blob:
-        imports.append("from typing import Any")
-    return sorted(set(imports))
+    return re.sub(r"[^a-zA-Z0-9]+", "_", title.lower()).strip("_")
 
 
 # -------------------------------------------------------- file rendering -----
 
-TEMPLATE = '''"""
-LeetCode {qid}: {title}
-
-{description}
-"""
-{imports_block}
-
-class Solution:
-    def {method}(self, {param_sig}) -> {ret}:
-        pass
-
-
-# ---------- Test runner ----------
-
-TEST_CASES = [
-    # ({test_header})
-{test_rows}
-]
+def fill_bodies(code: str) -> str:
+    """LeetCode leaves method bodies empty; add `pass` so the file parses."""
+    lines = code.rstrip().splitlines()
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        out.append(line)
+        if line.lstrip().startswith("def ") and line.rstrip().endswith(":"):
+            indent = len(line) - len(line.lstrip())
+            nxt = next((ln for ln in lines[i + 1:] if ln.strip()), "")
+            if len(nxt) - len(nxt.lstrip()) <= indent:
+                out.append(" " * (indent + 4) + "pass")
+    return "\n".join(out) + "\n"
 
 
-def run():
-    sol = Solution()
-    passed = 0
-    failed = 0
-    for case in TEST_CASES:
-        *args, expected, note = case
-        got = sol.{method}(*args)
-        ok = got == expected
-        status = "PASS" if ok else "FAIL"
-        print(f"[{{status}}] expected={{expected}}  got={{got}}  ({{note}})")
-        if ok:
-            passed += 1
-        else:
-            failed += 1
-    print(f"\\n{{passed}}/{{len(TEST_CASES)}} passed, {{failed}} failed")
-
-
-if __name__ == "__main__":
-    run()
-'''
-
-
-def render_test_row(arg_names: list[str], values: list[str], output: str, note: str) -> str:
-    arg_repr = ", ".join(to_py_literal(v) if v else "None" for v in values)
-    output_py = to_py_literal(output) if output else "None"
-    note_escaped = note.replace('"', '\\"')
-    return f'    ({arg_repr}, {output_py}, "{note_escaped}"),'
-
-
-def render_file(q: dict[str, Any]) -> tuple[str, Signature]:
-    sig = parse_meta(q["metaData"])
-    description = strip_html(q["content"])
-    examples = extract_examples(q["content"])
-
-    arg_names = [p.name for p in sig.params]
-    test_rows_lines: list[str] = []
-    if examples:
-        for idx, ex in enumerate(examples, 1):
-            pairs = dict(split_args(ex["input"]))
-            values = [pairs.get(name, "None") for name in arg_names]
-            output = ex["output"].strip()
-            note = f"Example {idx}"
-            test_rows_lines.append(render_test_row(arg_names, values, output, note))
-    else:
-        # No examples parseable — emit one placeholder.
-        values = ["None"] * len(arg_names)
-        test_rows_lines.append(render_test_row(arg_names, values, "None", "TODO: add cases"))
-
-    test_header = ", ".join(arg_names + ["expected", "note"])
-
-    param_sig = ", ".join(f"{p.name}: {p.py}" for p in sig.params)
-
-    imports = needed_imports(sig)
-    imports_block = ("\n".join(imports) + "\n") if imports else ""
-
-    return TEMPLATE.format(
-        qid=q.get("questionFrontendId") or q.get("questionId") or "?",
-        title=q["title"],
-        description=description,
-        imports_block=imports_block,
-        method=sig.method,
-        param_sig=param_sig,
-        ret=sig.ret,
-        test_header=test_header,
-        test_rows="\n".join(test_rows_lines),
-    ), sig
+def render_file(q: dict[str, Any], description: str) -> str:
+    snippet = next(
+        (s["code"] for s in q.get("codeSnippets") or [] if s["langSlug"] == "python3"),
+        None,
+    )
+    if snippet is None:
+        sys.exit("no python3 starter code for this problem (SQL / shell problem?)")
+    qid = q.get("questionFrontendId") or q.get("questionId") or "?"
+    doc = f"LeetCode {qid}: {q['title']}\n\n{description}"
+    doc = doc.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+    return f'"""\n{doc}\n"""\n\n{fill_bodies(snippet)}'
 
 
 # ------------------------------------------------------------ slug parsing ---
@@ -407,7 +239,8 @@ def normalize_slug(arg: str) -> str:
 # ------------------------------------------------------------------- main ----
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("slug", help="LeetCode title slug or full URL")
     ap.add_argument("--force", action="store_true", help="overwrite existing file")
     ap.add_argument("--dir", dest="dir_override", default=None,
@@ -419,7 +252,8 @@ def main() -> int:
     slug = normalize_slug(args.slug)
     q = fetch_question(slug)
 
-    rendered, _sig = render_file(q)
+    description = strip_html(q["content"])
+    rendered = render_file(q, description)
     if args.print:
         sys.stdout.write(rendered)
         return 0
@@ -427,18 +261,28 @@ def main() -> int:
     subdir = pick_subdir(q.get("topicTags", []), args.dir_override)
     repo_root = Path(__file__).resolve().parent.parent
     qid = q.get("questionFrontendId") or q.get("questionId") or "0"
-    fname = f"{int(qid):03d}_{snake_title(q['title'])}.py"
-    out_dir = repo_root / subdir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / fname
+    fname = f"{int(qid):03d}_{snake_title(q['title'])}"
+    out_path = repo_root / subdir / f"{fname}.py"
+    cases_path = repo_root / "cases" / f"{fname}.json"
 
     if out_path.exists() and not args.force:
         print(f"file exists: {out_path} (use --force to overwrite)", file=sys.stderr)
         return 1
 
+    cases = {
+        "slug": q["titleSlug"],
+        "meta": json.loads(q["metaData"]),
+        "cases": build_cases(q, description),
+    }
+    for p in (out_path, cases_path):
+        p.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(rendered, encoding="utf-8")
+    cases_path.write_text(json.dumps(cases, indent=2) + "\n", encoding="utf-8")
+
     rel = out_path.relative_to(repo_root)
-    print(f"wrote {rel}  [{q.get('difficulty', '?')} · {len(q.get('topicTags', []))} tags]")
+    print(f"wrote {rel}  [{q.get('difficulty', '?')} · "
+          f"{len(cases['cases'])} cases]")
+    print(f"run:  python scripts/run_lc.py {rel}")
     return 0
 
 

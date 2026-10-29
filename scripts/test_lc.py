@@ -26,4 +26,17 @@ assert build_cases(q, strip_html(content)) == [
     {"input": [[1, 2], 3], "output": [0, 1]},
     {"input": ["true", None], "output": False},
 ]
+
+# Design problems: two lines per case even when metaData has no "params".
+design = {"metaData": json.dumps({"classname": "D", "systemdesign": True}),
+          "exampleTestcases": '["D","add"]\n[[],[[3,10]]]'}
+assert build_cases(design, "Output\n[null, null]") == [
+    {"input": [["D", "add"], [[], [[3, 10]]]], "output": [None, None]}]
+
+# "Any order" ignores order at every level but still catches duplicates.
+from run_lc import same
+assert same([["b"], ["a", "c"]], [["c", "a"], ["b"]], True)
+assert not same([[1, 2], [1, 2]], [[1, 2], [2, 1]], True)
+assert not same([1, 2], [2, 1], False)
+assert same(0.30000001, 0.3, False)
 print("ok")

@@ -155,9 +155,12 @@ def build_cases(q: dict[str, Any], description: str) -> list[dict[str, Any]]:
     """
     Inputs come from `exampleTestcases` (one JSON value per line, one line per
     param). Outputs are scraped from the "Output:" lines of the description.
-    A case without "output" is still run; its result is printed, not checked.
+    Outputs that are not JSON (e.g. "Intersected at '8'") are kept as text.
+    A case without an output is still run; its result is printed, not checked.
     """
-    n_params = len(json.loads(q["metaData"]).get("params", [])) or 1
+    meta = json.loads(q["metaData"])
+    # Design problems always take two lines per case: op names, then op args.
+    n_params = 2 if meta.get("systemdesign") else len(meta.get("params", [])) or 1
     lines = [ln for ln in (q.get("exampleTestcases") or "").splitlines() if ln.strip()]
     inputs = [
         [json.loads(v) for v in lines[i:i + n_params]]
@@ -175,7 +178,7 @@ def build_cases(q: dict[str, Any], description: str) -> list[dict[str, Any]]:
             try:
                 case["output"] = json.loads(outputs[i].strip())
             except json.JSONDecodeError:
-                pass
+                case["output_text"] = outputs[i].strip()
         cases.append(case)
     return cases
 
@@ -272,6 +275,7 @@ def main() -> int:
     cases = {
         "slug": q["titleSlug"],
         "meta": json.loads(q["metaData"]),
+        "any_order": "in any order" in description,
         "cases": build_cases(q, description),
     }
     for p in (out_path, cases_path):
